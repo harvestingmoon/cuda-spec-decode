@@ -1,4 +1,4 @@
-"""Cross-checks dflash_cupy against speculators' DFlash loss spec.
+"""Cross-checks losses.dflash against speculators' DFlash loss spec.
 
 Oracle is copied from vllm-project/speculators:
   src/speculators/losses/utils.py   (dflash_loss_decay, loss_function, _LOSS_REDUCTION_EPS)
@@ -6,9 +6,10 @@ Oracle is copied from vllm-project/speculators:
 """
 import os, sys, numpy as np, torch
 import torch.nn.functional as F
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import cupy as cp
-from dflash_cupy import fused_dflash_loss, dflash_loss
+from losses.dflash import fused_dflash_loss, dflash_loss
+import losses.dflash as _dflash_mod
 
 fails = []
 def chk(name, cond, extra=""):
@@ -100,7 +101,7 @@ g = float(fused_dflash_loss(cp.asarray(lo), cp.asarray(tv), cp.asarray(z)))
 chk("all-masked -> 0", g == 0.0, f"got={g}")
 # anchor slot 0 has zero decay under the DFlash convention (decay from slot 1)
 lo = rng.normal(0, 1, (4, 8, 512)).astype(np.float32); tv = rng.normal(0, 1, (4, 8, 512)).astype(np.float32)
-from dflash_cupy import _forward as _dfwd
+from losses.dflash import _forward as _dfwd
 mk = np.ones((4, 8), np.float32)
 rows, _, _ = _dfwd(cp.asarray(lo), cp.asarray(tv), cp.asarray(mk), 4.0, False, "kl", None)
 rows_s, _, _ = _dfwd(cp.asarray(lo), cp.asarray(tv), cp.asarray(mk), 4.0, True, "kl", None)
@@ -189,7 +190,7 @@ with torch.no_grad():
 chk("works under torch.no_grad", bool(torch.isfinite(l)))
 # batch independence: a sequence's own loss must not depend on the other rows
 one = float(fused_dflash_loss(lc[:1], tc[:1]))
-loss_rows, _, _ = __import__("dflash_cupy")._forward(lc, tc, cp.ones((16, 8), cp.float32), 4.0, False, "kl", None)
+loss_rows, _, _ = _dflash_mod._forward(lc, tc, cp.ones((16, 8), cp.float32), 4.0, False, "kl", None)
 chk("per-sequence loss is batch independent",
     abs(float(loss_rows[0].sum()) - one) < 1e-3 * max(1, abs(one)),
     f"N=1: {one:.6f}  row0 of N=16: {float(loss_rows[0].sum()):.6f}")

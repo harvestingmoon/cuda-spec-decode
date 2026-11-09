@@ -10,20 +10,25 @@ Each one fuses a whole training loss — softmax, gather, per-position loss and 
 reduction — into a single pass over the logits, plus a fused backward. No softmax tensor is
 materialized, no V-sized intermediate is saved.
 
-## Files
+## Layout
 
-| file | what |
-|---|---|
-| `dpac_cupy.py` | D-PACE megakernel (forward + backward), cupy + torch entry points |
-| `dpace.py` | reference transcription of `_dpace_weight`, correctness oracle |
-| `test_dpac_cupy.py` | 38 checks against that oracle, incl. specforge's own test formula |
-| `dflash_cupy.py` | DFlash loss kernel (forward + backward), cupy + torch entry points |
-| `test_dflash_cupy.py` | 43 checks against speculators' `loss_function` / `dflash_loss_decay` |
+```
+losses/                 # how a drafter is trained -- loss kernels only, no model imports
+  dpace.py              #   D-PACE megakernel (forward + backward), cupy + torch entry points
+  dpace_ref.py          #   torch transcription of _dpace_weight (correctness oracle)
+  dflash.py             #   DFlash loss kernel (forward + backward)
+  tests/test_dpace.py   #   38 checks vs specforge's own test formula
+  tests/test_dflash.py  #   43 checks vs speculators' loss_function / dflash_loss_decay
+models/                 # what a drafter is -- one folder per method (empty for now)
+```
+
+`losses/` is model-agnostic: anything that emits `[N, B, V]` logits can use it. D-PACE is a loss,
+not a model, so it lives there alongside DFlash. See `models/README.md` for what goes the other way.
 
 ## Usage — D-PACE
 
 ```python
-from dpac_cupy import dpace_loss          # torch, autograd-aware
+from losses.dpace import dpace_loss       # torch, autograd-aware
 
 # logits   [N, B, V]  float32, CUDA      (N = batch of sequences, B = block <= 32)
 # targets  [N, B]     int64
@@ -35,7 +40,7 @@ loss.backward()
 Cupy-only / eval:
 
 ```python
-from dpac_cupy import fused_dpace_loss
+from losses.dpace import fused_dpace_loss
 loss = fused_dpace_loss(logits_cp, targets_cp, alpha=0.5, position_mask=mask_cp)
 ```
 
@@ -67,7 +72,7 @@ implementation (e.g. an older revision of `dpace.py`).
 
 ## Verified
 
-`python test_dpac_cupy.py` 38/38 pass (RTX 3060 6 GB, WSL2, cupy 14.0.1, torch 2.11+cu130):
+`python losses/tests/test_dpace.py` 38/38 pass (RTX 3060 6 GB, WSL2, cupy 14.0.1, torch 2.11+cu130):
 
 - forward matches SpecForge's `_naive_dpace_weight` oracle to <= 2e-3 rel: mask density 0/0.05/0.2/0.5,
   B = 1/4/8/16/32, V = 7 … 151936, alpha = 0/0.1/0.5/0.9/1, all three loss types, all-negative logits
@@ -78,6 +83,8 @@ implementation (e.g. an older revision of `dpace.py`).
 
 SpecForge's own `tests/test_utils/test_dflash_losses.py` also passes (9/9) against the upstream
 checkout, which is what the oracle above is copied from.
+
+Run both suites from the repo root; they import through the `losses` package.
 
 ## Speed — D-PACE (fwd + bwd, median of 30, RTX 3060)
 
@@ -101,7 +108,7 @@ KL from the draft to the **target logits**, masked, weighted by an exponential d
 index, summed over positions and divided by the valid-token count.
 
 ```python
-from dflash_cupy import dflash_loss      # torch, autograd-aware
+from losses.dflash import dflash_loss     # torch, autograd-aware
 
 # logits, target_logits  [N, B, V]  float32, CUDA   (B = positions/anchors*block_size)
 # loss_mask              [N, B]     bool/float, None = all positions
@@ -134,7 +141,7 @@ C = sum exp(xt - mp)(xl - mq)          D = sum exp(xl - mq)
 Backward is `dKL/dlogits = softmax(draft) - softmax(target)` (or `- onehot` for CE), scaled by
 `mask * decay / (count + 1e-5) / N`. Forward saves only `mq, mp, logzq, logzp, argmax` per row.
 
-## Verified — `python test_dflash_cupy.py`
+## Verified — `python losses/tests/test_dflash.py`
 
 Oracle is speculators' own `loss_function` + `dflash_loss_decay` + `eager.kl_div_loss` / `eager.ce_loss`,
 copied verbatim. 43/43 pass:

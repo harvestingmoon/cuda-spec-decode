@@ -1,4 +1,4 @@
-"""Cross-checks dpac_cupy against specforge's D-PACE spec.
+"""Cross-checks losses.dpace against specforge's D-PACE spec.
 
 Oracle is copied verbatim from D-PACE/tests/test_utils/test_dflash_losses.py
 (_naive_dpace_weight + the `sum(w*ce)/bsz` reduction), which that repo's own
@@ -6,10 +6,10 @@ suite pins against specforge/core/dflash.py::_dpace_weight.
 """
 import os, sys, numpy as np, torch
 import torch.nn.functional as F
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import cupy as cp
-from dpac_cupy import fused_dpace_loss, dpace_loss
-from dpace import d_pace_loss
+from losses.dpace import fused_dpace_loss, dpace_loss
+from losses.dpace_ref import d_pace_loss
 
 fails = []
 def chk(name, cond, extra=""):

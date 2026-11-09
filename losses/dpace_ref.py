@@ -1,3 +1,4 @@
+"""Reference D-PACE loss (torch), transcribed from specforge/core/dflash.py::_dpace_weight."""
 import torch
 import torch.nn.functional as F
 
