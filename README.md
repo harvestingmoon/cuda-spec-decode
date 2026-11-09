@@ -15,24 +15,20 @@ materialized, no `[., V]` intermediate is saved.
 Target: a megakernel per drafter, with the objective each method is trained with, and weight
 loading wired up to the matching verifier.
 
-| Method | Description | Example config | Optimization |
-|---|---|---|---|
-| EAGLE3 | Feature-based autoregressive drafting | Online external / Offline colocated / Offline disaggregated | LK loss |
-| P-EAGLE | Parallel EAGLE | Online external | — |
-| EAGLE3.1 | Feature-based autoregressive drafting with attention drift | Online external | — |
-| DFlash | Block-parallel drafting | Online external / Offline colocated / Online managed-local | D-PACE |
-| DFlash2 | DFlash with grouped dynamic convolution and top-k path selection | Online managed-local | D-PACE |
-| Domino | DFlash with GRU logit correction | Online external / Offline colocated / Online managed-local | — |
-| DSpark | Confidence-Scheduled Semi-Autoregressive Generation | Online external / Offline colocated | — |
+| Method | Description | Optimization |
+|---|---|---|
+| EAGLE | Feature-based autoregressive drafting | LK loss |
+| MTP | Multi-token prediction heads | — |
+| DFlash | Block-parallel drafting | D-PACE |
 
 Status:
 
 | | drafter | loss kernel |
 |---|---|---|
 | DFlash | done (`models/dflash/model.py`) | done — DFlash objective + D-PACE |
+| EAGLE | planned | planned — LK loss |
+| MTP | planned | not decided |
 | D-PACE | model-agnostic | done (`losses/dpace.py`) |
-| EAGLE3 / EAGLE3.1 / P-EAGLE | planned | planned — LK loss |
-| DFlash2, Domino, DSpark | planned | D-PACE where applicable |
 
 Weights: each `models/<name>/` is meant to pair with a `load_verifier_weights()`-style hook that
 reuses the verifier's `embed_tokens` and frozen `lm_head` (full- or reduced-vocab `t2d`/`d2t`

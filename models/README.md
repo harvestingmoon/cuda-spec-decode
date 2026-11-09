@@ -16,8 +16,8 @@ models/
 Planned, same shape:
 
 ```
-  medusa/     # Medusa heads: tree attention + per-head cross entropy
-  eagle/      # EAGLE autoregressive drafter
+  eagle/      # EAGLE feature-based autoregressive drafter
+  mtp/        # multi-token prediction heads
 ```
 
 Rules of the split:
@@ -27,7 +27,7 @@ Rules of the split:
 - **`models/<name>/` = one drafter** plus whatever is specific to it. A model may import
   `losses/`; the reverse is forbidden. So `models/dflash/loss.py` (an objective tied to the
   DFlash slot/decay convention) lives with its model, while `losses/dpace.py` can train
-  DFlash, Medusa or EAGLE unchanged.
+  DFlash, EAGLE or MTP unchanged.
 - the loss hook makes the swap real, not aspirational:
 
   ```python
