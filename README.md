@@ -1,29 +1,75 @@
-# CUDA spec-decode loss kernels
+# cuda-spec-decode
 
-**DPACE megakernel** and **DFlash loss** — unofficial implementations, based on the
-[D-PACE](https://github.com/Lucas-TY/D-PACE) GitHub repo (`specforge/core/dflash.py::_dpace_weight`,
-MIT, sgl-project, commit `f36bad6e`) and on
-[speculators](https://github.com/vllm-project/speculators) (`src/speculators/losses/`, vllm-project).
-Not affiliated with either project; the official losses are the upstream implementations above.
+Unofficial CUDA/cupy implementations of speculative-decoding drafters and their fused training
+objectives, built from [D-PACE / SpecForge](https://github.com/Lucas-TY/D-PACE)
+(`specforge/core/`, MIT, sgl-project, commit `f36bad6e`) and
+[speculators](https://github.com/vllm-project/speculators) (vllm-project). Not affiliated with
+either; the reference implementations are upstream.
 
-Each one fuses a whole training loss — softmax, gather, per-position loss and the position-weighting
-reduction — into a single pass over the logits, plus a fused backward. No softmax tensor is
-materialized, no V-sized intermediate is saved.
+Each megakernel fuses a whole training loss — softmax, per-position loss and the position-weighting
+reduction — into one pass over the logits, plus a fused backward. No softmax tensor is
+materialized, no `[., V]` intermediate is saved.
+
+## Roadmap
+
+Target: a megakernel per drafter, with the objective each method is trained with, and weight
+loading wired up to the matching verifier.
+
+| Method | Description | Example config | Optimization |
+|---|---|---|---|
+| EAGLE3 | Feature-based autoregressive drafting | Online external / Offline colocated / Offline disaggregated | LK loss |
+| P-EAGLE | Parallel EAGLE | Online external | — |
+| EAGLE3.1 | Feature-based autoregressive drafting with attention drift | Online external | — |
+| DFlash | Block-parallel drafting | Online external / Offline colocated / Online managed-local | D-PACE |
+| DFlash2 | DFlash with grouped dynamic convolution and top-k path selection | Online managed-local | D-PACE |
+| Domino | DFlash with GRU logit correction | Online external / Offline colocated / Online managed-local | — |
+| DSpark | Confidence-Scheduled Semi-Autoregressive Generation | Online external / Offline colocated | — |
+
+Status:
+
+| | drafter | loss kernel |
+|---|---|---|
+| DFlash | done (`models/dflash/model.py`) | done — DFlash objective + D-PACE |
+| D-PACE | model-agnostic | done (`losses/dpace.py`) |
+| EAGLE3 / EAGLE3.1 / P-EAGLE | planned | planned — LK loss |
+| DFlash2, Domino, DSpark | planned | D-PACE where applicable |
+
+Weights: each `models/<name>/` is meant to pair with a `load_verifier_weights()`-style hook that
+reuses the verifier's `embed_tokens` and frozen `lm_head` (full- or reduced-vocab `t2d`/`d2t`
+mapping), so a drafter checkpoint never re-ships the head. Only the DFlash drafter exists so far;
+the hook pattern is taken from `speculators` and is not implemented here yet.
 
 ## Layout
 
 ```
-losses/                 # how a drafter is trained -- loss kernels only, no model imports
-  dpace.py              #   D-PACE megakernel (forward + backward), cupy + torch entry points
-  dpace_ref.py          #   torch transcription of _dpace_weight (correctness oracle)
-  dflash.py             #   DFlash loss kernel (forward + backward)
-  tests/test_dpace.py   #   38 checks vs specforge's own test formula
-  tests/test_dflash.py  #   43 checks vs speculators' loss_function / dflash_loss_decay
-models/                 # what a drafter is -- one folder per method (empty for now)
+losses/                     # model-agnostic loss optimizations -- no model imports
+  dpace.py                  #   D-PACE megakernel (forward + backward), cupy + torch entry points
+  dpace_ref.py              #   torch transcription of _dpace_weight (correctness oracle)
+  tests/test_dpace.py       #   38 checks vs specforge's own test formula
+models/
+  dflash/
+    model.py                #   DFlash block drafter (slot queries, mask, feature fusion, draft)
+    loss.py                 #   its fused training objective (forward + backward)
+    tests/test_model.py     #   21 checks: shape/mask/draft/batch + the loss hook
+    tests/test_loss.py      #   43 checks vs speculators' loss_function / dflash_loss_decay
 ```
 
-`losses/` is model-agnostic: anything that emits `[N, B, V]` logits can use it. D-PACE is a loss,
-not a model, so it lives there alongside DFlash. See `models/README.md` for what goes the other way.
+**Split rule.** `losses/` holds only what can train *any* drafter that emits `[N, B, V]` logits —
+today that is D-PACE. A drafter and anything tied to its conventions live in `models/<name>/`:
+DFlash's exponential slot decay is part of the DFlash recipe, so its objective ships with the model.
+A model may import `losses/`, never the reverse. See `models/README.md`.
+
+The objective is a hook, so the same drafter trains under either loss:
+
+```python
+from models.dflash import DFlashSpeculator, dflash_loss
+from losses.dpace import dpace_loss
+
+model = DFlashSpeculator(d_target=4096, d_model=256, target_vocab_size=128256)
+loss = model.compute_loss(feats, tokens)                       # plain CE
+loss = model.compute_loss(feats, tokens, loss_fn=dflash_loss)  # DFlash objective
+loss = model.compute_loss(feats, tokens, loss_fn=lambda lg, tg: dpace_loss(lg, tg, 0.5))
+```
 
 ## Usage — D-PACE
 
@@ -101,14 +147,14 @@ vectorized torch version is already at parity, and the kernel is always ~2-3x a 
 `[N,B,V]` grad. The obvious next step would be a single online softmax pass and splitting the grid
 over `(n, j)` instead of one block per sequence — neither is implemented.
 
-## DFlash loss
+## DFlash drafter + objective
 
 The DFlash baseline from [speculators](https://github.com/vllm-project/speculators): per-position
 KL from the draft to the **target logits**, masked, weighted by an exponential decay over the slot
 index, summed over positions and divided by the valid-token count.
 
 ```python
-from losses.dflash import dflash_loss     # torch, autograd-aware
+from models.dflash import dflash_loss, DFlashSpeculator
 
 # logits, target_logits  [N, B, V]  float32, CUDA   (B = positions/anchors*block_size)
 # loss_mask              [N, B]     bool/float, None = all positions
@@ -141,7 +187,7 @@ C = sum exp(xt - mp)(xl - mq)          D = sum exp(xl - mq)
 Backward is `dKL/dlogits = softmax(draft) - softmax(target)` (or `- onehot` for CE), scaled by
 `mask * decay / (count + 1e-5) / N`. Forward saves only `mq, mp, logzq, logzp, argmax` per row.
 
-## Verified — `python losses/tests/test_dflash.py`
+## Verified — `python models/dflash/tests/test_loss.py`
 
 Oracle is speculators' own `loss_function` + `dflash_loss_decay` + `eager.kl_div_loss` / `eager.ce_loss`,
 copied verbatim. 43/43 pass:
