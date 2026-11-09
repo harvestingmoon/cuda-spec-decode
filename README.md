@@ -1,10 +1,8 @@
 # cuda-spec-decode
 
 Unofficial CUDA/cupy implementations of speculative-decoding drafters and their fused training
-objectives, built from [D-PACE / SpecForge](https://github.com/Lucas-TY/D-PACE)
-(`specforge/core/`, MIT, sgl-project, commit `f36bad6e`) and
-[speculators](https://github.com/vllm-project/speculators) (vllm-project). Not affiliated with
-either; the reference implementations are upstream.
+objectives, built from [speculators](https://github.com/vllm-project/speculators) (vllm-project).
+Not affiliated with them; their implementation is the reference.
 
 Each megakernel fuses a whole training loss — softmax, per-position loss and the position-weighting
 reduction — into one pass over the logits, plus a fused backward. No softmax tensor is
@@ -41,7 +39,7 @@ the hook pattern is taken from `speculators` and is not implemented here yet.
 losses/                     # model-agnostic loss optimizations -- no model imports
   dpace.py                  #   D-PACE megakernel (forward + backward), cupy + torch entry points
   dpace_ref.py              #   torch transcription of _dpace_weight (correctness oracle)
-  tests/test_dpace.py       #   38 checks vs specforge's own test formula
+  tests/test_dpace.py       #   38 checks vs an independent torch oracle
 models/
   dflash/
     model.py                #   DFlash block drafter (slot queries, mask, feature fusion, draft)
@@ -62,10 +60,42 @@ from models.dflash import DFlashSpeculator, dflash_loss
 from losses.dpace import dpace_loss
 
 model = DFlashSpeculator(d_target=4096, d_model=256, target_vocab_size=128256)
-loss = model.compute_loss(feats, tokens)                       # plain CE
-loss = model.compute_loss(feats, tokens, loss_fn=dflash_loss)  # DFlash objective
-loss = model.compute_loss(feats, tokens, loss_fn=lambda lg, tg: dpace_loss(lg, tg, 0.5))
+loss = model.compute_loss(feats, tokens)                                  # plain CE
+loss = model.compute_loss(feats, tokens,
+                          loss_fn=dflash_objective(target_logits))        # DFlash objective
+loss = model.compute_loss(feats, tokens,
+                          loss_fn=lambda lg, tg: dpace_loss(lg, tg, 0.5))  # D-PACE
 ```
+
+`dflash_objective(target_logits)` binds the verifier logits so the objective still matches the
+`loss_fn(logits, targets)` hook — the DFlash loss needs distributions, not token ids.
+
+## Pipeline (hot swap)
+
+`pipeline.py` picks a drafter and an objective by name; model build, batch, step and optimizer are
+shared, so adding a method is one entry in `METHODS`.
+
+```bash
+scripts/run.sh --list                             # dflash: ce, dflash, dpace
+scripts/run.sh --check                            # one step per (method, loss)
+scripts/run.sh --method dflash --loss dpace --steps 50
+scripts/run.sh --method dflash --loss ce --device cpu --steps 5
+
+PY=/path/to/env/bin/python scripts/run.sh --check  # if python3 is not the env with torch+cupy
+```
+
+`--check` builds a fresh drafter per pair, runs one real step and asserts the loss and every
+gradient are finite — that is the swap being wired, not merely importable. Current result:
+
+```
+PASS dflash/ce      loss=6.446990
+PASS dflash/dflash  loss=0.523283
+PASS dflash/dpace   loss=9.022427
+```
+
+Batches are synthetic (`--batch --seq --block --d-target --d-model --vocab` control the shapes) so
+the pipeline runs without a dataset; swap `make_batch` for the real verifier rollout when wiring a
+dataset. `ce` runs on CPU, the fused objectives need CUDA.
 
 ## Usage — D-PACE
 
@@ -145,9 +175,28 @@ over `(n, j)` instead of one block per sequence — neither is implemented.
 
 ## DFlash drafter + objective
 
-The DFlash baseline from [speculators](https://github.com/vllm-project/speculators): per-position
-KL from the draft to the **target logits**, masked, weighted by an exponential decay over the slot
-index, summed over positions and divided by the valid-token count.
+Same idea as [`speculators/models/dflash`](https://github.com/vllm-project/speculators/tree/main/src/speculators/models/dflash)
+— condition a small transformer on the verifier's hidden states and emit a whole K-token block in
+one pass, with block tokens attending to the full context — but **not the same implementation**.
+`models/dflash/model.py` is the original single-script DFlash sketch; upstream is the production
+Qwen3-anchored version. The differences:
+
+| | here | speculators |
+|---|---|---|
+| block input | K trainable slot queries appended to the context | noise embedding built from the anchor token + `mask_token_id`, one block per anchor |
+| target features | one hidden stream through `proj_in` | several target layers concatenated through `fc` + `hidden_norm` |
+| positions | none | Qwen3 RoPE with per-anchor block position ids |
+| output | `proj_out` back to `d_target` + optional `final_norm` | norm → frozen `verifier_lm_head` |
+| mask | dense: context causal, block sees all context and all block tokens | flex-attention `anchor_block_mask_mod`: per-document prefix, `is_causal`, optional sliding window, and blocks are isolated from each other |
+| slot 0 | always predicts | `sample_from_anchor` decides; otherwise slot 0 is dropped from the loss |
+| batch shape | `[N, S_ctx, d_target]` → `[N, K, V]` | packed `[1, T, ...]` + `document_ids`, `max_anchors`, `loss_mask` |
+
+So: same family, same training contract (`[N, K, V]` logits + the objective), different plumbing.
+Aligning it with upstream is a separate job (RoPE, `fc` fusion, anchor-block masks, verifier head).
+
+The objective itself follows upstream [speculators](https://github.com/vllm-project/speculators):
+per-position KL from the draft to the **target logits**, masked, weighted by an exponential decay
+over the slot index, summed over positions and divided by the valid-token count.
 
 ```python
 from models.dflash import dflash_loss, DFlashSpeculator
@@ -222,8 +271,7 @@ row, so it scales with `N*B` and does not idle on small batches.
 
 ## Attribution
 
-D-PACE and SpecForge: <https://github.com/Lucas-TY/D-PACE> (MIT, © 2025 sgl-project).
-Speculators / DFlash loss: <https://github.com/vllm-project/speculators> (vllm-project).
-These kernels are independent reimplementations of those losses; the math follows the upstream
-Python (`_dpace_weight`, `loss_function` + `dflash_loss_decay`), the CUDA is not derived from their
-Triton kernels.
+[speculators](https://github.com/vllm-project/speculators) (vllm-project) is the reference for the
+DFlash drafter and its loss. These kernels are independent reimplementations: the math follows the
+upstream Python (`loss_function` + `dflash_loss_decay`), the CUDA is not derived from their Triton
+kernels.

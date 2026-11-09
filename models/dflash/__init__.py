@@ -2,7 +2,7 @@
 
     from models.dflash import DFlashSpeculator, dflash_loss
 """
-from models.dflash.loss import dflash_loss, fused_dflash_loss
+from models.dflash.loss import dflash_loss, dflash_objective, fused_dflash_loss
 from models.dflash.model import DFlashAttention, DFlashSpeculator, DFlashTransformerLayer
 
 __all__ = [
@@ -10,5 +10,6 @@ __all__ = [
     "DFlashAttention",
     "DFlashTransformerLayer",
     "dflash_loss",
+    "dflash_objective",
     "fused_dflash_loss",
 ]

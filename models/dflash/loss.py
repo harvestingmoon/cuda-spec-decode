@@ -224,6 +224,15 @@ def fused_dflash_loss(logits_cp: cp.ndarray, target_logits_cp: cp.ndarray,
     return loss_rows.sum() / N          # sum over positions, mean over batch
 
 
+def dflash_objective(target_logits, **kwargs):
+    """Bind the target logits so the objective fits the (logits, targets) hook.
+
+    ``DFlashSpeculator.compute_loss(..., loss_fn=...)`` calls ``loss_fn(logits, targets)``,
+    but this objective needs the verifier's logits rather than token ids.
+    """
+    return lambda logits, _targets: dflash_loss(logits, target_logits, **kwargs)
+
+
 def _make_torch_fn():
     import torch  # lazy: cupy-only users never import torch
 
