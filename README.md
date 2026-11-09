@@ -1,22 +1,26 @@
-# DPACE megakernel
+# CUDA spec-decode loss kernels
 
-**Unofficial implementation, based on the [D-PACE](https://github.com/Lucas-TY/D-PACE) GitHub repo
-(`specforge/core/dflash.py::_dpace_weight`, MIT, sgl-project, commit `f36bad6e`).**
-Not affiliated with the authors; the official loss is the Triton/torch path in SpecForge above.
+**DPACE megakernel** and **DFlash loss** — unofficial implementations, based on the
+[D-PACE](https://github.com/Lucas-TY/D-PACE) GitHub repo (`specforge/core/dflash.py::_dpace_weight`,
+MIT, sgl-project, commit `f36bad6e`) and on
+[speculators](https://github.com/vllm-project/speculators) (`src/speculators/losses/`, vllm-project).
+Not affiliated with either project; the official losses are the upstream implementations above.
 
-A single CUDA kernel fuses the whole D-PACE forward softmax, target gather, cross entropy, the
-prefix-survival / continuation-value scan and the weighted reduction  into one pass over the
-logits, plus a fused backward. No softmax tensor is materialized, no V-sized intermediate is saved.
+Each one fuses a whole training loss — softmax, gather, per-position loss and the position-weighting
+reduction — into a single pass over the logits, plus a fused backward. No softmax tensor is
+materialized, no V-sized intermediate is saved.
 
 ## Files
 
 | file | what |
 |---|---|
-| `dpac_cupy.py` | the megakernel (forward + backward), cupy + torch entry points |
-| `dpace.py` | reference transcription of `_dpace_weight`, used as the correctness oracle |
-| `test_dpac_cupy.py` | 36 checks against that oracle, incl. specforge's own test formula |
+| `dpac_cupy.py` | D-PACE megakernel (forward + backward), cupy + torch entry points |
+| `dpace.py` | reference transcription of `_dpace_weight`, correctness oracle |
+| `test_dpac_cupy.py` | 38 checks against that oracle, incl. specforge's own test formula |
+| `dflash_cupy.py` | DFlash loss kernel (forward + backward), cupy + torch entry points |
+| `test_dflash_cupy.py` | 43 checks against speculators' `loss_function` / `dflash_loss_decay` |
 
-## Usage
+## Usage — D-PACE
 
 ```python
 from dpac_cupy import dpace_loss          # torch, autograd-aware
@@ -63,7 +67,7 @@ implementation (e.g. an older revision of `dpace.py`).
 
 ## Verified
 
-`python test_dpac_cupy.py` 36/36 pass (RTX 3060 6 GB, WSL2, cupy 14.0.1, torch 2.11+cu130):
+`python test_dpac_cupy.py` 38/38 pass (RTX 3060 6 GB, WSL2, cupy 14.0.1, torch 2.11+cu130):
 
 - forward matches SpecForge's `_naive_dpace_weight` oracle to <= 2e-3 rel: mask density 0/0.05/0.2/0.5,
   B = 1/4/8/16/32, V = 7 … 151936, alpha = 0/0.1/0.5/0.9/1, all three loss types, all-negative logits
@@ -75,7 +79,7 @@ implementation (e.g. an older revision of `dpace.py`).
 SpecForge's own `tests/test_utils/test_dflash_losses.py` also passes (9/9) against the upstream
 checkout, which is what the oracle above is copied from.
 
-## Speed (fwd + bwd, median of 30, RTX 3060)
+## Speed — D-PACE (fwd + bwd, median of 30, RTX 3060)
 
 | shape | kernel | vectorized torch | plain `F.cross_entropy` |
 |---|---|---|---|
@@ -90,17 +94,87 @@ vectorized torch version is already at parity, and the kernel is always ~2-3x a 
 `[N,B,V]` grad. The obvious next step would be a single online softmax pass and splitting the grid
 over `(n, j)` instead of one block per sequence — neither is implemented.
 
+## DFlash loss
+
+The DFlash baseline from [speculators](https://github.com/vllm-project/speculators): per-position
+KL from the draft to the **target logits**, masked, weighted by an exponential decay over the slot
+index, summed over positions and divided by the valid-token count.
+
+```python
+from dflash_cupy import dflash_loss      # torch, autograd-aware
+
+# logits, target_logits  [N, B, V]  float32, CUDA   (B = positions/anchors*block_size)
+# loss_mask              [N, B]     bool/float, None = all positions
+loss = dflash_loss(logits, target_logits, loss_mask=mask, gamma=4.0,
+                   sample_from_anchor=False, kind="kl", block_size=None)
+loss.backward()
+```
+
+`kind="ce"` switches to hard-label cross entropy (`argmax(target_logits)`); `block_size` sets how
+the decay index cycles when one sequence holds several anchors. Cupy-only: `fused_dflash_loss`.
+
+## Exactly what it computes
+
+```
+elementwise_j = KL(softmax(draft_j) || softmax(target_j))     # or CE vs argmax(target_j)
+decay_j       = exp(-(pos_j - 1)/gamma) * (pos_j != 0)        # sample_from_anchor=False
+                exp(-pos_j / gamma)                           # sample_from_anchor=True
+loss          = mean_n( sum_j mask_j * decay_j * elementwise_j / (sum_j mask_j + 1e-5) )
+```
+
+Same masking, decay, `+1e-5` denominator and batch reduction as `loss_function` upstream. KL is
+computed in two passes with an algebraically rewritten form, `(B - C)/A - log A + log D`, so it
+needs no third pass over the rows:
+
+```
+A = sum exp(xt - mp)      B = sum exp(xt - mp)(xt - mp)
+C = sum exp(xt - mp)(xl - mq)          D = sum exp(xl - mq)
+```
+
+Backward is `dKL/dlogits = softmax(draft) - softmax(target)` (or `- onehot` for CE), scaled by
+`mask * decay / (count + 1e-5) / N`. Forward saves only `mq, mp, logzq, logzp, argmax` per row.
+
+## Verified — `python test_dflash_cupy.py`
+
+Oracle is speculators' own `loss_function` + `dflash_loss_decay` + `eager.kl_div_loss` / `eager.ce_loss`,
+copied verbatim. 43/43 pass:
+
+- forward equals the oracle to 6 decimals: `kl` and `ce`, mask density 1/0.7/0.5/0, B = 1/4/8/12/16/32,
+  V = 7 … 151936, N up to 64, gamma = 1/4/10/100, `sample_from_anchor` both ways, `block_size` < B
+- backward matches torch autograd to 3e-7 … 6e-7 rel (all cases incl. masks and block_size)
+- finite-difference spot check: 3.9e-5 (kl) / 1.1e-4 (ce)
+- masked and anchor rows get exactly zero grad; slot 0 has zero decay under `sample_from_anchor=False`
+- all-masked → 0.0, per-sequence loss independent of the rest of the batch, forward bitwise repeatable
+- bad `gamma` / `kind` / `block_size` / shapes raise
+
+## Speed — DFlash (median of 30, RTX 3060)
+
+| shape | kernel fwd | kernel fwd+bwd | eager torch fwd | eager torch fwd+bwd |
+|---|---|---|---|---|
+| N=4 B=8 V=32000 | 0.20 ms | 0.65 ms | 0.32 ms | 0.61 ms |
+| N=4 B=8 V=151936 | 0.41 ms | 0.73 ms | 1.26 ms | 1.78 ms |
+| N=32 B=8 V=32000 | 0.43 ms | 0.76 ms | 1.87 ms | 2.75 ms |
+| N=8 B=16 V=32000 | 0.23 ms | 0.79 ms | 0.95 ms | 1.42 ms |
+| N=128 B=8 V=32000 | 1.65 ms | 3.34 ms | 7.46 ms | 10.94 ms |
+
+1.6-4.4x forward, 1.4-3.3x forward+backward. Unlike D-PACE this kernel is one block per position
+row, so it scales with `N*B` and does not idle on small batches.
+
 ## Limits
 
-- fp32 only (asserts; no fp16/bf16 path), `B <= 32`, contiguous inputs required
-- one thread block per sequence → for small N most SMs idle
-- assumes the default CUDA stream (cupy and torch both sit on it); a custom `torch.cuda.stream(...)`
-  would need an explicit sync
+- fp32 only (asserts; no fp16/bf16 path), contiguous inputs required; D-PACE additionally caps `B <= 32`
+- D-PACE: one thread block per sequence → for small N most SMs idle
+- both: assumes the default CUDA stream (cupy and torch both sit on it); a custom
+  `torch.cuda.stream(...)` would need an explicit sync
 - the grad returned by `backward` is a DLPack view into cupy's allocator, so torch's peak-memory
   accounting doesn't count it
+- DFlash: two full passes over two rows (max, then the weighted sums); an online single-pass variant
+  is not implemented
 
 ## Attribution
 
 D-PACE and SpecForge: <https://github.com/Lucas-TY/D-PACE> (MIT, © 2025 sgl-project).
-This kernel is an independent reimplementation of that loss for a different model/draft setup; the
-math follows `_dpace_weight`, the CUDA is not derived from SpecForge's Triton kernels.
+Speculators / DFlash loss: <https://github.com/vllm-project/speculators> (vllm-project).
+These kernels are independent reimplementations of those losses; the math follows the upstream
+Python (`_dpace_weight`, `loss_function` + `dflash_loss_decay`), the CUDA is not derived from their
+Triton kernels.
